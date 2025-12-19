@@ -1,0 +1,1269 @@
+{
+  "metadata": {
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3",
+      "language": "python"
+    },
+    "language_info": {
+      "name": "python",
+      "version": "3.12.12",
+      "mimetype": "text/x-python",
+      "codemirror_mode": {
+        "name": "ipython",
+        "version": 3
+      },
+      "pygments_lexer": "ipython3",
+      "nbconvert_exporter": "python",
+      "file_extension": ".py"
+    },
+    "colab": {
+      "provenance": [],
+      "gpuType": "T4",
+      "name": "notebook5f1d64effd",
+      "include_colab_link": true
+    },
+    "accelerator": "GPU",
+    "kaggle": {
+      "accelerator": "gpu",
+      "dataSources": [],
+      "dockerImageVersionId": 31236,
+      "isInternetEnabled": true,
+      "language": "python",
+      "sourceType": "notebook",
+      "isGpuEnabled": true
+    }
+  },
+  "nbformat_minor": 0,
+  "nbformat": 4,
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "view-in-github",
+        "colab_type": "text"
+      },
+      "source": [
+        "<a href=\"https://colab.research.google.com/github/mahadikprasad15/Advanced-NLP2/blob/main/Probes%20in%20Representational%20Learning\" target=\"_parent\"><img src=\"https://colab.research.google.com/assets/colab-badge.svg\" alt=\"Open In Colab\"/></a>"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "# 🔍 Probes in Representation Learning\n",
+        "\n",
+        "Probes are lightweight supervised models designed to predict properties of larger models. For example, probes have been learned to identify representations that exhibit strong circular patterns like representations of days of the week [1], and certain features in representations [2].\n",
+        "\n",
+        "In this practicum we will train *simple* probes to determine how much a model \"knows\" about **entities**, using only its internal hidden states as input. Entities are things like people, locations, world events, organizations, etc. You will explore how to extract meaningful internal signals about the model's computation before it generates any text.\n",
+        "\n",
+        "\n",
+        "\n",
+        "---\n",
+        "\n",
+        "## 🎯 Practicum Objectives\n",
+        "\n",
+        "By the end of this practicum, you will:\n",
+        "\n",
+        "- ✅ **Train probes** on the hidden representations of a pretrained model to quantify how much it knows about an entity.\n",
+        "- 📊 **Track and visualize training progress** using [Weights & Biases (wandb)](https://wandb.ai).\n",
+        "- ⚙️ **Tune hyperparameters** to ensure smooth and effective training of your probes.\n",
+        "\n",
+        "---\n",
+        "\n",
+        "## 🚧 Challenge\n",
+        "Experiment your way to the best probes — try different architectures, run hyperparameter searches, and see what configurations yield the highest correlation.\n",
+        "\n",
+        "---\n",
+        "\n",
+        "##🌟 Bonus\n",
+        "Apply your probing skills to reasoning models! Select a property that you hypothesize is encoded in their internal representations, and formulate it as a probing task. Then, design and train a probe that specifically targets and tests for this property.  \n",
+        "\n",
+        "---\n",
+        "## References\n",
+        "[1] [Not All Language Model Features Are One-Dimensionally Linear](https://arxiv.org/abs/2405.14860)\n",
+        "\n",
+        "[2] [Finding Neurons in a Haystack: Case Studies with Sparse Probing](https://arxiv.org/abs/2305.01610)"
+      ],
+      "metadata": {
+        "id": "5laHL1jEFpYg"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# @title Setup\n",
+        "\n",
+        "!pip install -U datasets\n",
+        "\n",
+        "from datasets import load_dataset\n",
+        "from huggingface_hub import hf_hub_download\n",
+        "import joblib\n",
+        "\n",
+        "import torch\n",
+        "import torch.nn as nn\n",
+        "import torch.optim as optim\n",
+        "from torch.utils.data import Dataset, DataLoader\n",
+        "\n",
+        "import copy\n",
+        "import wandb\n",
+        "import pickle\n",
+        "\n",
+        "import pandas as pd\n",
+        "from tqdm import tqdm\n",
+        "tqdm.pandas()\n",
+        "\n",
+        "import numpy as np\n",
+        "\n",
+        "from scipy.stats import pearsonr\n",
+        "from sklearn import preprocessing\n",
+        "\n",
+        "from ast import literal_eval\n",
+        "\n",
+        "import transformers\n",
+        "\n",
+        "import joblib\n",
+        "\n",
+        "huggingface_api_key = \"\" # @param {type:\"string\"}\n",
+        "\n",
+        "def set_requires_grad(requires_grad, *models):\n",
+        "  for model in models:\n",
+        "    if isinstance(model, torch.nn.Module):\n",
+        "      for param in model.parameters():\n",
+        "        param.requires_grad = requires_grad\n",
+        "    elif isinstance(model, (torch.nn.Parameter, torch.Tensor)):\n",
+        "      model.requires_grad = requires_grad\n",
+        "    else:\n",
+        "      assert False, \"unknown type %r\" % type(model)\n",
+        "\n",
+        "class LlamaModelAndTokenizer:\n",
+        "  def __init__(\n",
+        "      self,\n",
+        "      model_name=None,\n",
+        "      model=None,\n",
+        "      tokenizer=None,\n",
+        "      torch_dtype=None,\n",
+        "      requires_grad=False,\n",
+        "      ):\n",
+        "\n",
+        "    tokenizer = transformers.AutoTokenizer.from_pretrained(model_name, use_fast=False, token=huggingface_api_key)\n",
+        "    model = transformers.AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, token=huggingface_api_key)\n",
+        "    set_requires_grad(requires_grad, model)\n",
+        "    model.eval().cuda()\n",
+        "    self.tokenizer = tokenizer\n",
+        "    self.model = model\n",
+        "    self.num_layers = model.config.num_hidden_layers\n",
+        "    self.vocabulary_projection_function = lambda x, layer: self.model.lm_head(self.model.model.norm(x)) if layer < self.num_layers else self.model.lm_head(x)\n",
+        "    self.mlp_hidden_size = self.model.config.intermediate_size\n",
+        "\n",
+        "  def __repr__(self):\n",
+        "    \"\"\"String representation of this class.\n",
+        "    \"\"\"\n",
+        "    return (\n",
+        "        f\"ModelAndTokenizer(model: {type(self.model).__name__} \"\n",
+        "        f\"[{self.num_layers} layers], \"\n",
+        "        f\"tokenizer: {type(self.tokenizer).__name__})\"\n",
+        "        )\n",
+        "\n",
+        "mt = LlamaModelAndTokenizer(\n",
+        "            \"dhgottesman/llama2-7b-hf\",\n",
+        "            torch_dtype=None,\n",
+        "            requires_grad=False\n",
+        "        )\n",
+        "\n",
+        "!git clone https://github.com/dhgottesman/keen_estimating_knowledge_in_llms.git"
+      ],
+      "metadata": {
+        "id": "krH8ic8U23rw",
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-12-19T11:52:35.394025Z",
+          "iopub.execute_input": "2025-12-19T11:52:35.394315Z",
+          "iopub.status.idle": "2025-12-19T11:54:04.491414Z",
+          "shell.execute_reply.started": "2025-12-19T11:52:35.394279Z",
+          "shell.execute_reply": "2025-12-19T11:54:04.490454Z"
+        }
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "# 📚 Dataset\n",
+        "\n",
+        "The dataset consists of input-label pairs where each example corresponds to an **entity**. The **input** is a processed hidden representation of that entity from a language model, and the **label** is the model's performance on a set of related QA questions. For the sake of timing, we will provide you the full dataset below, but we encourage you to walk through the generation of the example input-label pair: `(\"Night Train to Lisbon\", 0.43)`.\n"
+      ],
+      "metadata": {
+        "id": "ymX0YFrAKZhN"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# @title Full Dataset and Dataloader\n",
+        "\n",
+        "class HiddenStatesDataset(Dataset):\n",
+        "    def __init__(self, X_train, y_train):\n",
+        "        self.df = X_train\n",
+        "        self.labels = y_train\n",
+        "\n",
+        "    def __len__(self):\n",
+        "        return len(self.df)\n",
+        "\n",
+        "    def __getitem__(self, idx):\n",
+        "        hidden_states = self.df.iloc[idx]\n",
+        "        accuracy = self.labels.iloc[idx]\n",
+        "        return torch.tensor(hidden_states, dtype=torch.float32), torch.tensor(accuracy, dtype=torch.float32)\n",
+        "\n",
+        "def load_train_split(filename: str) -> pd.DataFrame:\n",
+        "    path = hf_hub_download(\n",
+        "        repo_id=\"dhgottesman/keen_estimating_knowledge_in_llms\",\n",
+        "        filename=filename,\n",
+        "        repo_type=\"dataset\",\n",
+        "    )\n",
+        "    return pd.read_csv(path, index_col=0)\n",
+        "\n",
+        "def split_dataset_into_train_val_test(dataset, features=\"hidden_states\"):\n",
+        "    train_subjects = load_train_split(\"popqa_train_subjects.csv\")\n",
+        "    val_subjects = load_train_split(\"popqa_val_subjects.csv\")\n",
+        "    test_subjects = load_train_split(\"popqa_test_subjects.csv\")\n",
+        "\n",
+        "    train_df = dataset.merge(train_subjects, on=\"subject\").dropna()\n",
+        "    val_df = dataset.merge(val_subjects, on=\"subject\").dropna()\n",
+        "    test_df = dataset.merge(test_subjects, on=\"subject\").dropna()\n",
+        "\n",
+        "    X_train = train_df[features]\n",
+        "    y_train = train_df[\"accuracy\"]\n",
+        "    X_val = val_df[features]\n",
+        "    y_val = val_df[\"accuracy\"]\n",
+        "    X_test = test_df[features]\n",
+        "    y_test = test_df[\"accuracy\"]\n",
+        "    return X_train, y_train, X_val, y_val, X_test, y_test\n",
+        "\n",
+        "\n",
+        "dataset = load_dataset(\"dhgottesman/keen_estimating_knowledge_in_llms\", data_files=\"keen_llama2_7b_qa_data.csv\")\n",
+        "qa_dataset = pd.DataFrame(dataset['train'])\n",
+        "qa_dataset['hidden_states'] = qa_dataset['hidden_states'].progress_apply(literal_eval)\n",
+        "\n",
+        "scalers_path = hf_hub_download(\n",
+        "    repo_id=\"dhgottesman/keen_estimating_knowledge_in_llms\",\n",
+        "    filename=\"llama2_7b_qa_minmax_scalers.joblib\",\n",
+        "    repo_type=\"dataset\"\n",
+        ")"
+      ],
+      "metadata": {
+        "id": "h4aIOuDlJ3z_",
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-12-19T11:54:04.49314Z",
+          "iopub.execute_input": "2025-12-19T11:54:04.494416Z",
+          "iopub.status.idle": "2025-12-19T11:55:01.272433Z",
+          "shell.execute_reply.started": "2025-12-19T11:54:04.494382Z",
+          "shell.execute_reply": "2025-12-19T11:55:01.271626Z"
+        }
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "qa_dataset"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-12-19T11:55:01.273472Z",
+          "iopub.execute_input": "2025-12-19T11:55:01.273946Z",
+          "iopub.status.idle": "2025-12-19T11:55:01.31876Z",
+          "shell.execute_reply.started": "2025-12-19T11:55:01.273919Z",
+          "shell.execute_reply": "2025-12-19T11:55:01.318086Z"
+        },
+        "id": "z7EIAlGkoeJ9"
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "## 🏷️ Label Generation\n",
+        "\n",
+        "To generate the label for the entity *\"Night Train to Lisbon\"*, we use the questions provided by [PopQA](https://huggingface.co/datasets/akariasai/PopQA) and prompt LLaMa-2 7B to answer them. The questions and corresponding responses are shown below.\n",
+        "\n",
+        "| Question | Response |\n",
+        "|----------|----------|\n",
+        "| What genre is *Night Train to Lisbon*? | *Night Train to Lisbon* is a romantic drama. |\n",
+        "| What is the setting of *Night Train to Lisbon*? | The setting is Portugal in 1938. |\n",
+        "| What is the theme of *Night Train to Lisbon*? | Exploration of identity, history, and human connection. |\n",
+        "| Who was the producer of *Night Train to Lisbon*? | The film was produced by Paulo Branco, who also produced *The Secret Garden*. |\n",
+        "| What is the name of the film that was released in 2004? | The film was released in 2004 and was called *The Secret Garden*. |\n",
+        "| What color is *Night Train to Lisbon*? | *Night Train to Lisbon* is a 2013 drama film directed by Bille August and starring Jeremy Irons, Charlotte Rampling, and Martina Gedeck. It is based on the 1994 novel of the same name. |\n",
+        "| What is the country of origin of *Night Train to Lisbon*? | The film is a French–Portuguese co-production. |\n",
+        "| What is the running time of *Night Train to Lisbon*? | The film is 110 minutes long. |\n",
+        "| What is the language of *Night Train to Lisbon*? | The primary language is Portuguese, with other European languages featured. |\n",
+        "| Who was the director of *Night Train to Lisbon*? | The director is Bille August. |\n",
+        "| Who was the screenwriter for *Night Train to Lisbon*? | The screenwriter is Ruth Prawer Jhabvala. |\n",
+        "| Who was the composer of *Night Train to Lisbon*? | The composer is Alberto Iglesias. |\n"
+      ],
+      "metadata": {
+        "id": "PB0d-aBJ8KeE"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "#@title Example Dataframe\n",
+        "#@markdown This example walks you through how to calculate the gold **label** (the number we expect the probe to predict) for the entity *\"Night Train to Lisbon\"*.\n",
+        "example = pd.DataFrame([\n",
+        "    [\"What genre is Night Train to Lisbon?\",\n",
+        "     \"<s>What genre is Night Train to Lisbon?\\nNight Train to Lisbon is a romantic drama.\\nWhat is the setting of Night Train to Lisbon?\\nThe setting of Night Train to Lisbon is Portugal in 1938.\\nWhat is the theme of Night Train to Lisbon\",\n",
+        "     ['based on literature', 'mystery film', 'drama movie', 'film based on literature', 'drama film']\n",
+        "     ],\n",
+        "\n",
+        "    [\"Who was the producer of Night Train to Lisbon?\",\n",
+        "     \"<s>Who was the producer of Night Train to Lisbon?\\nThe film was produced by Paulo Branco, who also produced the film The Secret Garden.\\nWhat is the name of the film that was released in 2004?\\nThe film was released in 2004 and was called The\",\n",
+        "     ['Kerstin Ramcke']\n",
+        "     ],\n",
+        "\n",
+        "    [\"What color is Night Train to Lisbon?\",\n",
+        "     \"<s>What color is Night Train to Lisbon?\\nNight Train to Lisbon is a 2013 drama film directed by Bille August and starring Jeremy Irons, Charlotte Rampling, and Martina Gedeck. It is based on the 1994 novel of the same\",\n",
+        "     ['colour film', 'color film', 'color', 'colour', 'full color']\n",
+        "     ],\n",
+        "\n",
+        "    [\"What is the country of origin of Night Train to Lisbon?\",\n",
+        "     \"<s>What is the country of origin of Night Train to Lisbon?\\nThe film is a French-Portuguese co-production.\\nWhat is the running time of Night Train to Lisbon?\\nThe film is 110 minutes long.\\nWhat is the language of Night Train to Lisbon?\",\n",
+        "     ['PT', 'Bundesrepublik Deutschland', 'POR', 'Portuguese Republic', 'DE', 'GFR', 'Switzerland', 'CHE', 'CH', 'PRT', '🇵🇹', 'de', 'Deutschland', 'Portugal', 'GER', 'Germany', 'Federal Republic of Germany', 'Confoederatio Helvetica', 'Swiss Confederation', 'BRD', 'Swiss', 'BR Deutschland', 'SUI'],\n",
+        "    ],\n",
+        "\n",
+        "    [\"Who was the director of Night Train to Lisbon?\",\n",
+        "     \"<s>Who was the director of Night Train to Lisbon?\\nWhat is the name of the director of Night Train to Lisbon?\\nWhat is the name of the director of Night Train to Lisbon? The director of Night Train to Lisbon is Bille August.\\nWhat is the name of the director of\",\n",
+        "     ['Bille August']\n",
+        "     ],\n",
+        "\n",
+        "    [\"Who was the screenwriter for Night Train to Lisbon?\",\n",
+        "     \"<s>Who was the screenwriter for Night Train to Lisbon?\\nThe screenwriter for Night Train to Lisbon was Ruth Prawer Jhabvala.\\nWhat is the name of the screenwriter for Night Train to Lisbon?\\nThe screenwriter for Night Train to Lisbon is Ruth Prawer Jhab\",\n",
+        "     ['Greg Latter', 'Peter Bieri', 'Pascal Mercier', 'Ulrich Herrmann']\n",
+        "     ],\n",
+        "\n",
+        "    [\"Who was the composer of Night Train to Lisbon?\",\n",
+        "     \"<s>Who was the composer of Night Train to Lisbon?\\nThe composer of the film Night Train to Lisbon is Alberto Iglesias.\\nWhat is the name of the composer of the film Night Train to Lisbon?\\nThe name of the composer of the film Night Train to Lisbon is Alberto Igles\",\n",
+        "     ['Annette Focks']\n",
+        "     ]\n",
+        "], columns=[\"question\", \"generation\", \"possible_answers\"])\n",
+        "\n",
+        "def label_generation(generation, answers):\n",
+        "    for answer in answers:\n",
+        "        if answer.lower() in generation.lower():\n",
+        "            return 3\n",
+        "    for hedged_answer in [\"nobody knows\", \"I'm sorry\", \"I can't seem to find the answer\", \"you help me\", \"anyone help me\", \"I'm not sure\", \"I don't know\"]:\n",
+        "        if hedged_answer.lower() in generation.lower():\n",
+        "            return 2\n",
+        "    return 1\n",
+        "\n",
+        "def binary_label(label, class_label):\n",
+        "    return 1 if label == class_label else 0\n",
+        "\n",
+        "example[\"generation_label\"] = example.apply(lambda row: label_generation(row[\"generation\"], row[\"possible_answers\"]), axis=1)\n",
+        "example[\"correct\"] = example[\"generation_label\"].apply(lambda x: binary_label(x, 3))\n",
+        "example[\"hedge\"] = example[\"generation_label\"].apply(lambda x: binary_label(x, 2))\n",
+        "example[\"mistake\"] = example[\"generation_label\"].apply(lambda x: binary_label(x, 1))\n",
+        "\n",
+        "print(f\"QA Accuracy for Night Train to Lisbon is {example['correct'].mean():.2f}\")"
+      ],
+      "metadata": {
+        "id": "c3kcG4e6-QeR",
+        "cellView": "form",
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-12-19T11:55:01.319737Z",
+          "iopub.execute_input": "2025-12-19T11:55:01.320152Z",
+          "iopub.status.idle": "2025-12-19T11:55:01.332507Z",
+          "shell.execute_reply.started": "2025-12-19T11:55:01.320116Z",
+          "shell.execute_reply": "2025-12-19T11:55:01.331735Z"
+        }
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "## 🧠 Input Representation Generation\n",
+        "\n",
+        "To generate the probe inputs (features):\n",
+        "\n",
+        "*For every entity in the dataset,*\n",
+        "1. **Construct a prompt** of the form:  \n",
+        "   `\"This document describes [ENTITY]\"`  \n",
+        "   where `[ENTITY]` is replaced with the actual entity name.\n",
+        "2. **Run a forward pass** through the model using this prompt.\n",
+        "3. **Extract hidden representations** from layers 21-23 of the last token position of `[ENTITY]` which are stored in the columns `layer_0, layer_1, layer_2`, respectively.\n",
+        "---\n",
+        "*Now that we’ve obtained the hidden representations for each entity, the next step is to normalize them relative to one another. This is important because the probe learns a separate weight for each input dimension. Without normalization, we lack a consistent way to interpret the magnitude of the given logit value in a dimension. For simplicity, we provide the scaler fitted for this dataset, and use it in the example below.*\n",
+        "\n",
+        "4. For each layer, separately:\n",
+        "   - **Stack** the hidden representations.\n",
+        "   - **Apply min–max normalization** across the logit dimension.\n",
+        "\n",
+        "*Normalization is done per layer since the distribution of logits changes throughout the computation.*\n",
+        "\n",
+        "5. **Average the normalized layer representations** (per entity) across the logit dimension to get a single vector per entity.\n",
+        "6. These averaged vectors serve as the **input features** for the probe."
+      ],
+      "metadata": {
+        "id": "VmFMJDXG8Ngc"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# @title Helpers for Preparing Probe Inputs\n",
+        "def document_prefix(subject):\n",
+        "    return f\"This document describes {subject}\"\n",
+        "\n",
+        "def normalize_inputs(hidden_states):\n",
+        "    \"\"\"\n",
+        "    hidden_states: list of length = n_layers, each item is (hidden_dim,) array-like\n",
+        "    returns: list of scaled per-layer vectors (or a single averaged vector if avg=True)\n",
+        "    \"\"\"\n",
+        "    scalers = joblib.load(scalers_path)\n",
+        "\n",
+        "    # Step 4\n",
+        "    scaled = []\n",
+        "    for i, hs in enumerate(hidden_states):\n",
+        "        hs = np.asarray(hs).reshape(1, -1)           # (1, hidden_dim)\n",
+        "        hs_scaled = scalers[i].transform(hs)[0]      # back to (hidden_dim,)\n",
+        "        scaled.append(hs_scaled)\n",
+        "\n",
+        "    # Step 5\n",
+        "    return scaled, np.mean(np.stack(scaled, axis=0), axis=0).tolist()"
+      ],
+      "metadata": {
+        "id": "NjHn5cpqDjop",
+        "cellView": "form",
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-12-19T11:55:01.334323Z",
+          "iopub.execute_input": "2025-12-19T11:55:01.334584Z",
+          "iopub.status.idle": "2025-12-19T11:55:01.349737Z",
+          "shell.execute_reply.started": "2025-12-19T11:55:01.334563Z",
+          "shell.execute_reply": "2025-12-19T11:55:01.348992Z"
+        }
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "#@title Example of Preparing Probe Inputs\n",
+        "# @markdown This is an example of how to prepare the probe inputs for the entity *\"Night Train to Lisbon\"*.\n",
+        "\n",
+        "# Step 1\n",
+        "entity = \"Night Train to Lisbon\"\n",
+        "prompt = document_prefix(\"Night Train to Lisbon\")\n",
+        "\n",
+        "# Steps 2-3\n",
+        "with torch.no_grad():\n",
+        "    inp = mt.tokenizer(prompt, return_tensors=\"pt\").to('cuda')\n",
+        "    output = mt.model(**inp, output_hidden_states = True)\n",
+        "\n",
+        "layers = list(range(int(mt.num_layers*.75)-3, int(mt.num_layers*.75)))\n",
+        "hidden_states = []\n",
+        "for layer in layers:\n",
+        "    hs = output[\"hidden_states\"][layer][0][-1]\n",
+        "    hidden_states.append(hs.detach().cpu().numpy().tolist())\n",
+        "\n",
+        "\n",
+        "# Steps 4-5, annotated in the helper functions above.\n",
+        "hidden_states, probe_input = normalize_inputs(hidden_states)\n",
+        "\n",
+        "print(f\"hidden_states (input to probe): {probe_input}\")\n",
+        "for i in range(len(layers)):\n",
+        "  print(f\"layer_{i}: {hidden_states[i]}\")"
+      ],
+      "metadata": {
+        "id": "Jh7skepcD5CU",
+        "cellView": "form",
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-12-19T11:55:01.350623Z",
+          "iopub.execute_input": "2025-12-19T11:55:01.350977Z",
+          "iopub.status.idle": "2025-12-19T11:55:02.03444Z",
+          "shell.execute_reply.started": "2025-12-19T11:55:01.350932Z",
+          "shell.execute_reply": "2025-12-19T11:55:02.033537Z"
+        }
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# @markdown The input size is the hidden dimension of the LLaMa-2 7B model.\n",
+        "len(qa_dataset.iloc[2000][\"hidden_states\"])"
+      ],
+      "metadata": {
+        "id": "y2zXCyP8KN23",
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-12-19T11:55:02.035559Z",
+          "iopub.execute_input": "2025-12-19T11:55:02.035909Z",
+          "iopub.status.idle": "2025-12-19T11:55:02.040675Z",
+          "shell.execute_reply.started": "2025-12-19T11:55:02.035854Z",
+          "shell.execute_reply": "2025-12-19T11:55:02.040018Z"
+        }
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "## 🧾 Final Dataset Structure\n",
+        "\n",
+        "The final dataset is stored as a DataFrame with the following columns:\n",
+        "\n",
+        "- `hidden_states`: A vector containing the normalized, averaged hidden states for the entity.\n",
+        "- `accuracy`: The model's per-entity accuracy on PopQA questions."
+      ],
+      "metadata": {
+        "id": "4o8S7D4j8Snx"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "qa_dataset.accuracy"
+      ],
+      "metadata": {
+        "id": "xg8USrJlZyh6",
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-12-19T11:55:02.041562Z",
+          "iopub.execute_input": "2025-12-19T11:55:02.041815Z",
+          "iopub.status.idle": "2025-12-19T11:55:02.060524Z",
+          "shell.execute_reply.started": "2025-12-19T11:55:02.041786Z",
+          "shell.execute_reply": "2025-12-19T11:55:02.059797Z"
+        }
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "qa_dataset.hidden_states"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-12-19T11:55:02.064852Z",
+          "iopub.execute_input": "2025-12-19T11:55:02.06516Z",
+          "iopub.status.idle": "2025-12-19T11:55:02.080527Z",
+          "shell.execute_reply.started": "2025-12-19T11:55:02.065128Z",
+          "shell.execute_reply": "2025-12-19T11:55:02.079803Z"
+        },
+        "id": "dHpQqcaWoeJ_"
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "# Linear Probe\n",
+        "\n",
+        "We define the probe as one linear layer: `f(z, θ) := θ · z`.\n",
+        "\n",
+        "Where:\n",
+        "\n",
+        "- `z` is the hidden representation vector for an entity\n",
+        "- `θ` is a learnable parameter vector (same size as `z`)\n",
+        "\n",
+        "In training, we aim to increase the correlation between the score predicted by the probe and the gold **label** metric (QA accuracy).\n",
+        "\n",
+        "\n"
+      ],
+      "metadata": {
+        "id": "Qh-u_v_SJj7z"
+      }
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "# Training\n",
+        "\n",
+        "The goal of this task is to train a probe that predicts model accuracy based on hidden representations.  \n",
+        "\n",
+        "---\n",
+        "\n",
+        "### 🎯 Objective: Minimize MSE\n",
+        "\n",
+        "We learn the probe weights `θ` by minimizing the **Mean Squared Error (MSE)** between the predicted score and the true accuracy label `y` for each entity with hidden representation feature `z`.\n",
+        "\n",
+        "The loss is defined as:\n",
+        "`L_MSE(z, θ) = || y - f(z, θ)||²`\n",
+        "\n",
+        "Lower MSE indicates that the probe is better at capturing how well the model performs based on its internal states.\n",
+        "\n",
+        "---"
+      ],
+      "metadata": {
+        "id": "DXcKsqXHyV8b"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# @title Training Configuration\n",
+        "input_size = 4096\n",
+        "learning_rate = 0.00001 # @param {type:\"raw\"}\n",
+        "max_iter = 5 # @param {type:\"integer\"}\n",
+        "batch_size = 32 # @param {type:\"integer\"}\n",
+        "\n",
+        "X_train, y_train, X_val, y_val, X_test, y_test = split_dataset_into_train_val_test(qa_dataset)\n",
+        "\n",
+        "train_dataset = HiddenStatesDataset(X_train, y_train)\n",
+        "dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=1)"
+      ],
+      "metadata": {
+        "id": "CRfScZvYyksl",
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-12-19T11:55:02.081658Z",
+          "iopub.execute_input": "2025-12-19T11:55:02.082033Z",
+          "iopub.status.idle": "2025-12-19T11:55:04.098893Z",
+          "shell.execute_reply.started": "2025-12-19T11:55:02.081998Z",
+          "shell.execute_reply": "2025-12-19T11:55:04.098365Z"
+        }
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# @title LinearProbe\n",
+        "class LinearProbe(nn.Module):\n",
+        "    def __init__(self, input_size, learning_rate, max_iter):\n",
+        "        super().__init__()\n",
+        "        self.max_iter = max_iter\n",
+        "        self.criterion = nn.MSELoss()\n",
+        "        self.layer = nn.Linear(input_size, 1, bias=False)\n",
+        "        self._initialize_weights()\n",
+        "\n",
+        "        self.optimizer = optim.AdamW(self.parameters(), lr=learning_rate)\n",
+        "        self.best_weights = copy.deepcopy(self.layer.state_dict())\n",
+        "        self.best_val_corr = -1\n",
+        "        self.final_val = None\n",
+        "\n",
+        "        self.cuda()\n",
+        "\n",
+        "    def _initialize_weights(self):\n",
+        "        nn.init.kaiming_uniform_(self.layer.weight, nonlinearity=\"relu\")\n",
+        "\n",
+        "    def forward(self, x):\n",
+        "        return self.layer(x)\n",
+        "\n",
+        "    def predict(self, x):\n",
+        "        with torch.no_grad():\n",
+        "            return self.forward(x)\n",
+        "\n",
+        "    def validate(self, X_val, y_val):\n",
+        "        preds = self.predict(X_val)\n",
+        "        y_val = y_val.reshape(-1, 1)\n",
+        "        loss = self.criterion(preds, y_val).item()\n",
+        "        preds_np = preds.squeeze(-1).cpu().numpy()\n",
+        "        targets_np = y_val.squeeze(-1).cpu().numpy()\n",
+        "        corr, p_val = pearsonr(preds_np, targets_np)\n",
+        "\n",
+        "        result_df = pd.DataFrame({\"preds\": preds_np, \"target\": targets_np})\n",
+        "        return result_df, loss, corr, p_val\n",
+        "\n",
+        "    def set_to_best_weights(self):\n",
+        "        self.layer.load_state_dict(self.best_weights)\n",
+        "\n",
+        "    def fit(self, X_train, y_train, X_val, y_val):\n",
+        "        X_val = torch.tensor(X_val, dtype=torch.float32).cuda()\n",
+        "        y_val = torch.tensor(y_val, dtype=torch.float32).cuda()\n",
+        "\n",
+        "        for epoch in tqdm(range(self.max_iter), total=self.max_iter):\n",
+        "            self.train()\n",
+        "            total_loss = 0\n",
+        "\n",
+        "            for batch_x, batch_y in X_train:\n",
+        "                self.optimizer.zero_grad()\n",
+        "                batch_x = batch_x.to(torch.float32).cuda()\n",
+        "                batch_y = batch_y.to(torch.float32).reshape(-1, 1).cuda()\n",
+        "\n",
+        "                preds = self.forward(batch_x)\n",
+        "                loss = self.criterion(preds, batch_y)\n",
+        "                loss.backward()\n",
+        "                self.optimizer.step()\n",
+        "                total_loss += loss.item()\n",
+        "\n",
+        "            avg_train_loss = total_loss / len(X_train)\n",
+        "            result_df, val_loss, corr, _ = self.validate(X_val, y_val)\n",
+        "            if corr > self.best_val_corr:\n",
+        "                self.best_val_corr = corr\n",
+        "                self.best_weights = copy.deepcopy(self.layer.state_dict())\n",
+        "                self.final_val = result_df\n",
+        "\n",
+        "            wandb.log({\"train_loss\": avg_train_loss, \"val_loss\": val_loss, \"val_pearson_corr\": corr})\n",
+        "\n",
+        "        wandb.finish()"
+      ],
+      "metadata": {
+        "id": "2hYKmpVqOa8D",
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-12-19T11:55:46.894583Z",
+          "iopub.execute_input": "2025-12-19T11:55:46.89492Z",
+          "iopub.status.idle": "2025-12-19T11:55:46.906066Z",
+          "shell.execute_reply.started": "2025-12-19T11:55:46.894889Z",
+          "shell.execute_reply": "2025-12-19T11:55:46.905191Z"
+        }
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "## 📈 Tracking with Weights & Biases (wandb)\n",
+        "\n",
+        "To monitor and visualize your training process, set up a [Weights & Biases (wandb)](https://wandb.ai) account.\n",
+        "\n",
+        "Follow the official quickstart guide to get started:  \n",
+        "👉 [https://docs.wandb.ai/quickstart/](https://docs.wandb.ai/quickstart/)\n",
+        "\n",
+        "Once configured, you’ll be able to:\n",
+        "\n",
+        "- Track training metrics like loss and MSE in real time\n",
+        "- Compare runs using different hyperparameters and models\n",
+        "\n",
+        "\n"
+      ],
+      "metadata": {
+        "id": "ANNDL02SJzTG"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# @title Connecting/Initializing wandb\n",
+        "!wandb login  adfbaadf2a50a1a3628c1abf9c768cdf92378965 # PASTE WANDB API KEY\n",
+        "\n",
+        "\n",
+        "wandb.init(\n",
+        "    project=\"my-linear-probe\",   # REQUIRED → all runs grouped under this project\n",
+        "    name=\"run-0\",                 # optional: gives this run a readable name\n",
+        "    config={                      # optional: hyperparameters & settings\n",
+        "        \"learning_rate\": learning_rate,\n",
+        "        \"max_iter\": max_iter,\n",
+        "        \"batch_size\": batch_size,\n",
+        "        \"model\": \"LinearProbe\"\n",
+        "    }\n",
+        ")"
+      ],
+      "metadata": {
+        "id": "3cpYwwcryEbl",
+        "cellView": "form",
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-12-19T11:57:14.157084Z",
+          "iopub.execute_input": "2025-12-19T11:57:14.157839Z",
+          "iopub.status.idle": "2025-12-19T11:57:32.237247Z",
+          "shell.execute_reply.started": "2025-12-19T11:57:14.157808Z",
+          "shell.execute_reply": "2025-12-19T11:57:32.236611Z"
+        }
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "## 🏃 Kicking Off Training\n",
+        "\n",
+        "Stop training when you observe overfitting."
+      ],
+      "metadata": {
+        "id": "P1It3hxjzHIK"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "probe = LinearProbe(input_size, learning_rate, max_iter)\n",
+        "probe.fit(dataloader, y_train, X_val, y_val)"
+      ],
+      "metadata": {
+        "id": "UceBjCawy-hn",
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-12-19T11:57:32.238606Z",
+          "iopub.execute_input": "2025-12-19T11:57:32.238848Z",
+          "iopub.status.idle": "2025-12-19T11:57:39.823991Z",
+          "shell.execute_reply.started": "2025-12-19T11:57:32.238823Z",
+          "shell.execute_reply": "2025-12-19T11:57:39.823095Z"
+        }
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "probe.set_to_best_weights()"
+      ],
+      "metadata": {
+        "id": "Ect2wvWVQSSX",
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-12-19T12:00:51.993292Z",
+          "iopub.execute_input": "2025-12-19T12:00:51.993853Z",
+          "iopub.status.idle": "2025-12-19T12:00:51.997526Z",
+          "shell.execute_reply.started": "2025-12-19T12:00:51.993823Z",
+          "shell.execute_reply": "2025-12-19T12:00:51.99671Z"
+        }
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "## 📝 Exercise: Compute the Pearson Correlation on the test set.\n",
+        "\n"
+      ],
+      "metadata": {
+        "id": "uWGJpJiMWVnJ"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-12-19T12:07:02.827042Z",
+          "iopub.execute_input": "2025-12-19T12:07:02.827379Z",
+          "iopub.status.idle": "2025-12-19T12:07:02.831614Z",
+          "shell.execute_reply.started": "2025-12-19T12:07:02.827351Z",
+          "shell.execute_reply": "2025-12-19T12:07:02.830755Z"
+        },
+        "id": "0nJ8KjKcoeKA"
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "result_df_test, test_loss, test_corr, _ = probe.validate(torch.tensor(X_test, device = device), torch.tensor(y_test, device = device))\n",
+        "print(f\"Test MSE: {test_loss:.4f}\")\n",
+        "print(f\"Test Pearson correlation: {test_corr:.4f}\")"
+      ],
+      "metadata": {
+        "id": "h2gmHHM1WWlp",
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-12-19T12:07:27.578882Z",
+          "iopub.execute_input": "2025-12-19T12:07:27.579677Z",
+          "iopub.status.idle": "2025-12-19T12:07:28.070775Z",
+          "shell.execute_reply.started": "2025-12-19T12:07:27.579637Z",
+          "shell.execute_reply": "2025-12-19T12:07:28.070048Z"
+        }
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "## 📝 Exercise: Plot the range of scores learned by your probe.\n",
+        "\n"
+      ],
+      "metadata": {
+        "id": "LmjzaXqGXine"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "probe.final_val"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-12-19T12:13:16.12774Z",
+          "iopub.execute_input": "2025-12-19T12:13:16.128397Z",
+          "iopub.status.idle": "2025-12-19T12:13:16.136494Z",
+          "shell.execute_reply.started": "2025-12-19T12:13:16.128367Z",
+          "shell.execute_reply": "2025-12-19T12:13:16.135934Z"
+        },
+        "id": "eG9c6wIcoeKB"
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "import matplotlib.pyplot as plt\n",
+        "\n",
+        "# Use validation results or test results\n",
+        "df = probe.final_val  # or result_df_test\n",
+        "\n",
+        "plt.figure(figsize=(6, 6))\n",
+        "plt.scatter(df[\"preds\"], df[\"target\"], alpha=0.3)\n",
+        "plt.xlabel(\"True QA accuracy\")\n",
+        "plt.ylabel(\"Probe score\")\n",
+        "plt.title(\"True vs Predicted Knowledge Scores\")\n",
+        "plt.grid(True)\n",
+        "plt.show()\n",
+        "\n",
+        "# Optional: distribution plots\n",
+        "plt.figure()\n",
+        "plt.hist(df[\"preds\"], bins=20, alpha=0.5, label=\"True\")\n",
+        "plt.hist(df[\"target\"], bins=20, alpha=0.5, label=\"Pred\")\n",
+        "plt.legend()\n",
+        "plt.title(\"Distribution of True Accuracies vs Probe Scores\")\n",
+        "plt.show()\n"
+      ],
+      "metadata": {
+        "id": "M5MMku5QWedj",
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-12-19T12:15:07.374009Z",
+          "iopub.execute_input": "2025-12-19T12:15:07.374745Z",
+          "iopub.status.idle": "2025-12-19T12:15:07.65005Z",
+          "shell.execute_reply.started": "2025-12-19T12:15:07.374717Z",
+          "shell.execute_reply": "2025-12-19T12:15:07.649395Z"
+        }
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "## 📝 Exercise: Implement the Last Pieces of the Probe\n",
+        "\n",
+        "- Do the current predicted scores align with the range of the gold labels?  \n",
+        "- What architectural changes might help bring the probe's outputs closer to the true scale?\n",
+        "\n",
+        "🔍 **Tip:** When you initiate a new training run, make sure to reset the run `name` in the wandb configuration."
+      ],
+      "metadata": {
+        "id": "6Mu_QMU4TpIt"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "class LinearProbe(nn.Module):\n",
+        "    def __init__(self, input_size, learning_rate, max_iter):\n",
+        "        super().__init__()\n",
+        "        self.max_iter = max_iter\n",
+        "        self.criterion = nn.MSELoss()\n",
+        "        self.layer = nn.Linear(input_size, 1, bias=True)\n",
+        "        self._initialize_weights()\n",
+        "\n",
+        "        self.optimizer = optim.AdamW(self.parameters(), lr=learning_rate)\n",
+        "        self.best_weights = copy.deepcopy(self.layer.state_dict())\n",
+        "        self.best_val_corr = -1\n",
+        "        self.final_val = None\n",
+        "\n",
+        "        self.cuda()\n",
+        "\n",
+        "    def _initialize_weights(self):\n",
+        "        # Optimized for Sigmoid: keeps variance stable\n",
+        "        nn.init.xavier_uniform_(self.layer.weight)\n",
+        "        if self.layer.bias is not None:\n",
+        "            nn.init.zeros_(self.layer.bias)\n",
+        "\n",
+        "    def forward(self, x):\n",
+        "        return torch.sigmoid(self.layer(x))\n",
+        "\n",
+        "    def predict(self, x):\n",
+        "        self.eval() # Ensure eval mode to turn off dropout/batchnorm if added later\n",
+        "        with torch.no_grad():\n",
+        "            # Defensive check: ensure input is on same device as model\n",
+        "            x = x.to(next(self.parameters()).device)\n",
+        "            return self.forward(x)\n",
+        "\n",
+        "    def validate(self, X_val, y_val):\n",
+        "        # 1. Handle device and type conversion internally\n",
+        "        device = next(self.parameters()).device\n",
+        "        if not isinstance(X_val, torch.Tensor):\n",
+        "            X_val = torch.tensor(X_val.values if hasattr(X_val, 'values') else X_val, dtype=torch.float32)\n",
+        "        if not isinstance(y_val, torch.Tensor):\n",
+        "            y_val = torch.tensor(y_val.values if hasattr(y_val, 'values') else y_val, dtype=torch.float32)\n",
+        "\n",
+        "        X_val = X_val.to(device)\n",
+        "        y_val = y_val.to(device).reshape(-1, 1)\n",
+        "\n",
+        "        preds = self.predict(X_val)\n",
+        "        loss = self.criterion(preds, y_val).item()\n",
+        "\n",
+        "        preds_np = preds.squeeze(-1).cpu().numpy()\n",
+        "        targets_np = y_val.squeeze(-1).cpu().numpy()\n",
+        "\n",
+        "        # Pearson correlation\n",
+        "        corr, p_val = pearsonr(preds_np, targets_np)\n",
+        "\n",
+        "        result_df = pd.DataFrame({\"preds\": preds_np, \"target\": targets_np})\n",
+        "        return result_df, loss, corr, p_val\n",
+        "\n",
+        "    def set_to_best_weights(self):\n",
+        "        self.layer.load_state_dict(self.best_weights)\n",
+        "\n",
+        "    def fit(self, X_train, y_train, X_val, y_val):\n",
+        "        X_val = torch.tensor(X_val, dtype=torch.float32).cuda()\n",
+        "        y_val = torch.tensor(y_val, dtype=torch.float32).cuda()\n",
+        "\n",
+        "        for epoch in tqdm(range(self.max_iter), total=self.max_iter):\n",
+        "            self.train()\n",
+        "            total_loss = 0\n",
+        "\n",
+        "            for batch_x, batch_y in X_train:\n",
+        "                self.optimizer.zero_grad()\n",
+        "                batch_x = batch_x.to(torch.float32).cuda()\n",
+        "                batch_y = batch_y.to(torch.float32).reshape(-1, 1).cuda()\n",
+        "\n",
+        "                preds = self.forward(batch_x)\n",
+        "                loss = self.criterion(preds, batch_y)\n",
+        "                loss.backward()\n",
+        "                self.optimizer.step()\n",
+        "                total_loss += loss.item()\n",
+        "\n",
+        "            avg_train_loss = total_loss / len(X_train)\n",
+        "            result_df, val_loss, corr, _ = self.validate(X_val, y_val)\n",
+        "            if corr > self.best_val_corr:\n",
+        "                self.best_val_corr = corr\n",
+        "                self.best_weights = copy.deepcopy(self.layer.state_dict())\n",
+        "                self.final_val = result_df\n",
+        "\n",
+        "            wandb.log({\"train_loss\": avg_train_loss, \"val_loss\": val_loss, \"val_pearson_corr\": corr})\n",
+        "\n",
+        "        wandb.finish()"
+      ],
+      "metadata": {
+        "id": "IgrzBy-2WcjD",
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-12-19T12:30:52.242884Z",
+          "iopub.execute_input": "2025-12-19T12:30:52.243475Z",
+          "iopub.status.idle": "2025-12-19T12:30:52.258375Z",
+          "shell.execute_reply.started": "2025-12-19T12:30:52.243446Z",
+          "shell.execute_reply": "2025-12-19T12:30:52.257669Z"
+        }
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "wandb.init()\n",
+        "\n",
+        "probe = LinearProbe(input_size, learning_rate = 0.001, max_iter = 15)\n",
+        "probe.fit(dataloader, y_train, X_val, y_val)\n",
+        "\n",
+        "result_df_test, test_loss, test_corr, _ = probe.validate(torch.tensor(X_test, device = device), torch.tensor(y_test, device = device))\n",
+        "print(f\"Test MSE: {test_loss:.4f}\")\n",
+        "print(f\"Test Pearson correlation: {test_corr:.4f}\")"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-12-19T12:32:49.415205Z",
+          "iopub.execute_input": "2025-12-19T12:32:49.41556Z",
+          "iopub.status.idle": "2025-12-19T12:33:16.425215Z",
+          "shell.execute_reply.started": "2025-12-19T12:32:49.41552Z",
+          "shell.execute_reply": "2025-12-19T12:33:16.42444Z"
+        },
+        "id": "IIJEPG16oeKB"
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# Use validation results or test results\n",
+        "df = probe.final_val  # or result_df_test\n",
+        "\n",
+        "plt.figure(figsize=(6, 6))\n",
+        "plt.scatter(df[\"preds\"], df[\"target\"], alpha=0.3)\n",
+        "plt.xlabel(\"True QA accuracy\")\n",
+        "plt.ylabel(\"Probe score\")\n",
+        "plt.title(\"True vs Predicted Knowledge Scores\")\n",
+        "plt.grid(True)\n",
+        "plt.show()\n",
+        "\n",
+        "# Optional: distribution plots\n",
+        "plt.figure()\n",
+        "plt.hist(df[\"preds\"], bins=20, alpha=0.5, label=\"True\")\n",
+        "plt.hist(df[\"target\"], bins=20, alpha=0.5, label=\"Pred\")\n",
+        "plt.legend()\n",
+        "plt.title(\"Distribution of True Accuracies vs Probe Scores\")\n",
+        "plt.show()\n"
+      ],
+      "metadata": {
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-12-19T12:33:16.426659Z",
+          "iopub.execute_input": "2025-12-19T12:33:16.427064Z",
+          "iopub.status.idle": "2025-12-19T12:33:16.71731Z",
+          "shell.execute_reply.started": "2025-12-19T12:33:16.427033Z",
+          "shell.execute_reply": "2025-12-19T12:33:16.716625Z"
+        },
+        "id": "nShAr6PPoeKB"
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "## 📝 Exercise: Use the probe in the wild!\n",
+        "\n",
+        "What sorts of scores does the probe learn for:\n",
+        "- Fictitious entities, e.g. *\"Mount Aeloria\"*\n",
+        "- Rare entities, e.g. *\"Cymothoida\"*\n",
+        "- Typo's, e.g. *Gooogle*, *\"Facebuk\"*\n",
+        "- Canonical vs aliase names, e.g. *\"Barack Obama* vs. *\"47th U.S. President\"*\n",
+        "\n"
+      ],
+      "metadata": {
+        "id": "4388ZBY6Q4Ts"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# For a given entity, create the probe input and compute the predicted score.\n",
+        "entity = \"Japan\"\n",
+        "prompt =  document_prefix(entity)\n",
+        "\n",
+        "with torch.no_grad():\n",
+        "    inp = mt.tokenizer(prompt, return_tensors=\"pt\").to('cuda')\n",
+        "    output = mt.model(**inp, output_hidden_states = True)\n",
+        "\n",
+        "layers = list(range(int(mt.num_layers*.75)-3, int(mt.num_layers*.75)))\n",
+        "hidden_states = []\n",
+        "for layer in layers:\n",
+        "    hs = output[\"hidden_states\"][layer][0][-1]\n",
+        "    hidden_states.append(hs.detach().cpu().numpy().tolist())\n",
+        "\n",
+        "\n",
+        "# Steps 4-5, annotated in the helper functions above.\n",
+        "hidden_states, probe_input = normalize_inputs(hidden_states)\n",
+        "\n",
+        "\n",
+        "probe_score = probe(torch.tensor(probe_input).to('cuda')).item()\n",
+        "print(f'Score for {entity} is {probe_score:.2f}')\n"
+      ],
+      "metadata": {
+        "id": "GMpgaZf2_JI8",
+        "trusted": true,
+        "execution": {
+          "iopub.status.busy": "2025-12-19T12:39:23.144513Z",
+          "iopub.execute_input": "2025-12-19T12:39:23.14481Z",
+          "iopub.status.idle": "2025-12-19T12:39:23.271513Z",
+          "shell.execute_reply.started": "2025-12-19T12:39:23.144783Z",
+          "shell.execute_reply": "2025-12-19T12:39:23.270666Z"
+        }
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "# 🚧 Challenge\n",
+        "\n",
+        "\n",
+        "Your goal is to train the most effective probe you can. Be creative! Consider changes to the architecture, hyperparameters (and more!) that might improve performance. Try to attain a correlation value above 0.64.\n",
+        "\n",
+        "### ⚙️ Development Process\n",
+        "- Use the validation set (`X_val, y_val`) to guide your design choices.\n",
+        "- Tune and iterate until you’re satisfied with your model’s performance.\n",
+        "\n",
+        "### 📊 Final Evaluation\n",
+        "Once you’ve locked in your configuration, evaluate **only once** on the held-out test set (`X_test, y_test`) and report your final correlation results."
+      ],
+      "metadata": {
+        "id": "_dmuWvzAR4YI"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [],
+      "metadata": {
+        "id": "dmE7P0W-SUu8"
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "# 🧩 Bonus: Probing Internal Reasoning\n",
+        "**Reasoning models** are large language models that have been further trained to perform well on tasks that require multi-step reasoning. These tasks often involve long chains of thought or a *thinking* processes. Examples include complex mathematical proofs, scientific reasoning, and challenging information-seeking queries.  \n",
+        "\n",
+        "**What kinds of properties might be encoded in the internal representations of reasoning models?**\n",
+        "\n",
+        "Your task is to select one such property and formulate it as a probing task.\n",
+        "\n",
+        "### Datasets\n",
+        "- [Reasoning Dataset Space](https://huggingface.co/collections/open-r1/reasoning-datasets-67980cac6e816a0eda98c678)\n",
+        "- [PrOntoQA](https://huggingface.co/datasets/renma/ProntoQA)\n",
+        "- [OpenMathReasoning](https://huggingface.co/datasets/nvidia/OpenMathReasoning/viewer/default/cot?row=0)\n",
+        "- [Humantity's Last Exam](https://huggingface.co/datasets/cais/hle)\n",
+        "- [MoNaCo](https://huggingface.co/datasets/allenai/MoNaCo_Benchmark)\n",
+        "\n",
+        "### Models\n",
+        "- [S1](https://huggingface.co/papers/2501.19393)\n",
+        "- [R1](https://huggingface.co/deepseek-ai/DeepSeek-R1)\n"
+      ],
+      "metadata": {
+        "id": "xqhpvvJ1VvOZ"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [],
+      "metadata": {
+        "id": "_UxPnO-DVsJ1"
+      },
+      "outputs": [],
+      "execution_count": null
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "*If you found this practicum interesting, you are welcome to read the work that inspired it: [Estimating Knowledge in Large Language Models Without Generating a Single Token](https://aclanthology.org/2024.emnlp-main.232/)!*"
+      ],
+      "metadata": {
+        "id": "HmVKduN4WyZE"
+      }
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "Copyright (c) 2025 Mor Geva and Daniela Gottesman\n"
+      ],
+      "metadata": {
+        "id": "BzL-o4h8VqbA"
+      }
+    }
+  ]
+}
